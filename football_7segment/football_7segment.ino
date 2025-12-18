@@ -1,6 +1,10 @@
 #define INVERT_DISPLAY false 
 #define DIGITS_DISPLAY 8
 
+#include "IR_rousis_keys.h"
+
+#include <IRrecv.h>
+#include <IRutils.h>
 #include <esp_now.h>
 #include <esp32fota.h>
 #include <WiFi.h>
@@ -20,6 +24,8 @@
 #define LED 13
 #define RXD2 16
 #define TXD2 17
+#define RXD1 19
+#define TXD1 18
 #define DIR 4
 #define REG1 10
 #define REG_TIME 10
@@ -41,10 +47,17 @@
 #define INSTR_6 0xA156
 #define INSTR_7 0xA157
 #define INSTR_8 0xA158
+//----------------------------------------------------------------------------------
+
+
+const uint16_t kRecvPin = 35;
+IRrecv irrecv(kRecvPin);
+decode_results results;
+
 //===========================================================================
 //   WiFi now 
-// 7C:DF:A1:F3:71:A8
-uint8_t broadcastAddress1[] = { 0x7C, 0xDF, 0xA1, 0xF3, 0x71, 0xA8 };
+// MAC:38:18:2B:3C:EF:24
+uint8_t broadcastAddress1[] = { 0x38, 0x18, 0x2B, 0x3C, 0xEF, 0x24 }; // MAC Address of the receiver
 esp_err_t result;
 
 typedef struct struct_packet {
@@ -111,8 +124,8 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 #define EEP_HUMI_DISP 207
 #define EEP_COUNTDOWN 208
 
-const String soft_version = "2.0.4";
-const char* soft_ID = "Rousis Systems LTD\nScoreboard_V: 2.0.4";
+const String soft_version = "2.0.6";
+const char* soft_ID = "Rousis Systems LTD\nScoreboard_V: 2.0.6";
 //============================================================================
 // DS1302 RTC instance
 Ds1302 rtc(4, 32, 2);
@@ -134,6 +147,9 @@ int i = 0;
 char Display_buf[15];
 uint8_t Score_host = 0;
 uint8_t Score_guest = 0;
+uint8_t Team_fouls_host = '0';
+uint8_t Team_fouls_guest = '0';
+uint8_t Period = '0';
 uint8_t Brightness = 255;
 uint8_t BrighT_Update_Count = 0;
 uint8_t Clock_Updated_once = 0;
@@ -182,6 +198,7 @@ unsigned long photo_delay = 0;
 #define COUNTDOWN_INIT_TIME 45 //45 Minutes
 unsigned int compare_elapsed = 10000;
 uint16_t countdown_time;
+uint16_t offset_time = 0;
 int minutes = 0;
 int seconds = 0;
 bool countdown_on = false;
@@ -211,7 +228,7 @@ uint16_t tempoNumber;
 uint16_t hostNumber;
 uint16_t guestNumber;
 uint16_t cntdownTime;
-
+uint16_t liveTime;
 
 Chrono chrono(Chrono::SECONDS);
 //----------------------------------------------------------------------------------------
@@ -250,19 +267,25 @@ void IRAM_ATTR FlashInt()
 // ---------------------------------------------------------------------------------------
 //  UI functions callback
 void getTimeCallback(Control* sender, int type) {
-
     if (type == B_UP) {
+        //reset the mainTime callback
+        ESPUI.getControl(mainTime)->callback = generalCallback;
+        //update the mainTime callback
+
+        ESPUI.updateTime(mainTime);
+    }
+
+    /*if (type == B_UP) {
         Serial.print("Time set: ID: ");
         Serial.print(sender->id);
         Serial.print(", Value: ");
         Serial.println(sender->value);
         ESPUI.updateTime(mainTime);
-
     }
     else if (type == TM_VALUE) {
         Serial.print("Time_Value: ");
         Serial.println(sender->value);
-    }
+    }*/
 }
 
 void numberCall(Control* sender, int type) {
@@ -460,16 +483,22 @@ void ScoreboardCallback(Control* sender, int type) {
         if (sender->value == "Sart" && game_on)
         {
             chrono.resume();
+			//Send Start instruction to the shoot clock
+			Serial1.write(0XA1); Serial1.write(0X53);
+
             buzzer_ring(1);
         }
         else if (sender->value == "Stop")
 		{
 			chrono.stop();
+            //Send Stop instruction to the shoot clock
+            Serial1.write(0XA1); Serial1.write(0X54);
             buzzer_ring(1);
 		}
 		else if (sender->value == "Up cunter")
 		{
             compare_elapsed = -1;
+            offset_time = 0;
 			chrono.restart();
             chrono.stop();
 			countdown_on = false;
@@ -477,7 +506,8 @@ void ScoreboardCallback(Control* sender, int type) {
 		}
 		else if (sender->value == "Countdown")
 		{
-            compare_elapsed = -1;		
+            compare_elapsed = -1;	
+            offset_time = 0;
             uint8_t cntint = EEPROM.read(EEP_COUNTDOWN);
             if (cntint > 99)
                 cntint = COUNTDOWN_INIT_TIME;
@@ -506,6 +536,9 @@ void ScoreboardCallback(Control* sender, int type) {
 		{
 			Score_host = 0;
 			Score_guest = 0;
+            Team_fouls_host = '0';
+            Team_fouls_guest = '0';
+            Period = '0';
 			score_to_buf();
 			myLED.print(Display_buf, INVERT_DISPLAY);
 			updateStatusBoard();
@@ -656,6 +689,29 @@ void generalCallback(Control* sender, int type) {
         EEPROM.write(EEP_COUNTDOWN, sender->value.toInt());
         EEPROM.commit();
     }
+    else if (sender->label == "Timer value")
+    {
+        Serial.print("Change Timer to: ");
+        //Serial.println(sender->value);
+        // convert sender->value in 2 integers minutes and seconds
+        int sep = sender->value.indexOf(':');
+        minutes = sender->value.substring(0, sep).toInt();
+        seconds = sender->value.substring(sep + 1).toInt();
+        Serial.print("Minutes: "); Serial.print(minutes);
+        Serial.print(" Seconds: "); Serial.println(seconds);
+
+        offset_time = (minutes * 60 + seconds);
+        // check if chrono is running
+        if (chrono.isRunning())
+        {
+            chrono.restart();
+        }
+        else {
+            chrono.restart();
+            chrono.stop();
+        }
+        
+	}
 }
 
 void readStringFromEEPROM(String& buf, int baseaddress, int size) {
@@ -725,10 +781,12 @@ void setup() {
 	Serial.println(soft_ID);
 	Serial.println("-------------------------------------------------");
     //-----------------------------------------------------------------------
+    irrecv.enableIRIn();
 
     chrono.start();
     chrono.stop();
     Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+	Serial1.begin(115200, SERIAL_8N1, RXD1, TXD1);
     sensors.begin();
     sensors.setResolution(9);
     rtc.init();
@@ -881,6 +939,9 @@ void setup() {
     ESPUI.addControl(ControlType::Button, "ButF1", "F1", ControlColor::None, ButtonsGame, &ScoreboardCallback);
     ESPUI.addControl(ControlType::Button, "ButHorn", "Horn", ControlColor::None, ButtonsGame, &ScoreboardCallback);
     ESPUI.addControl(ControlType::Button, "ButClear", "Clear", ControlColor::None, ButtonsGame, &ScoreboardCallback);
+
+    liveTime = ESPUI.addControl(Text, "Timer value", "", Carrot, tab1, &generalCallback);
+    ESPUI.setInputType(liveTime, "time");
 
     hostNumber = ESPUI.addControl(Number, "Host score", String(Score_host), Emerald, tab1, &generalCallback);
     guestNumber = ESPUI.addControl(Number, "Guest score", String(Score_guest), Emerald, tab1, &generalCallback);
@@ -1051,10 +1112,15 @@ void Task0code(void* pvParameters) {
             }
             int countdown_elapled;
             if (countdown_on) {
-                countdown_elapled = countdown_time - chrono.elapsed();
+                if (offset_time != 0) {
+                    countdown_elapled = offset_time - chrono.elapsed();
+                }
+                else {
+                    countdown_elapled = countdown_time - chrono.elapsed();
+                }
             }
             else {
-                countdown_elapled = chrono.elapsed();
+                countdown_elapled = chrono.elapsed() + offset_time;
             }
             seconds = countdown_elapled % 60;
             minutes = (countdown_elapled / 60) % 60;
@@ -1082,18 +1148,23 @@ void Task0code(void* pvParameters) {
             switch (Instruction)
             {
 			case INSTR_1:
-				Serial.println();
-				Serial.println("Start the timer");
+				
                 if (game_on) {
                     chrono.resume();
+                    //Send Start instruction to the shoot clock
+                    Serial1.write(0XA1); Serial1.write(0X53);
                     buzzer_ring(1);
                 }				
+                Serial.println();
+                Serial.println("Start the timer");
 				break;
-			case INSTR_2:
-				Serial.println();
-				Serial.println("Stop the timer");
+			case INSTR_2:		
 				chrono.stop();
+                //Send Stop instruction to the shoot clock
+                Serial1.write(0XA1); Serial1.write(0X53);
 				buzzer_ring(1);
+                Serial.println();
+                Serial.println("Stop the timer");
 				break;
 			case INSTR_3:
                 Serial.println();
@@ -1141,6 +1212,21 @@ void Task0code(void* pvParameters) {
 
             Serial.println(); Serial.println();
         }
+
+        if (irrecv.decode(&results)) {
+            if (results.decode_type == NEC && results.address == NEC_ADD_ROUSIS) {
+                handleIRCommand(results.command);
+            }
+            else if (results.decode_type == NEC && results.command == 0xFFFFFFFF) {
+                handleIRCommand(results.command); // Handle repeat code
+            }
+            else {
+                //Serial.print("Unsupported IR signal or invalid address: ");
+                //Serial.print("Protocol="); Serial.print(results.decode_type);
+                //Serial.print(", Address=0x"); Serial.println(results.address, HEX);
+            }
+            irrecv.resume();
+		}
 
         delay(2);
     }
@@ -1214,7 +1300,7 @@ void loop() {
                 char buf[10] = { 0 };
                 itoa(temperature, buf, 10);
 
-                if (DIGITS_DISPLAY == 8)
+                if (DIGITS_DISPLAY >= 8)
                 {
                     Display_buf[0] = buf[0];
                     Display_buf[1] = buf[1];
@@ -1322,7 +1408,7 @@ void displayocalDate() {
     char month[3];
     strftime(month, 3, "%m", &timeinfo);
     char Displaybuf[6];
-    if (DIGITS_DISPLAY == 8)
+    if (DIGITS_DISPLAY >= 8)
     {
         Displaybuf[0] = date[0];
         Displaybuf[1] = date[1] | 0x80;
@@ -1354,7 +1440,7 @@ void displayocalTime(uint8_t dots_on) {
     char timeMinute[3];
     strftime(timeMinute, 3, "%M", &timeinfo);
     //char Displaybuf[6];
-    if (DIGITS_DISPLAY == 8)
+    if (DIGITS_DISPLAY >= 8)
     {
         Display_buf[0] = timeHour[0];
         Display_buf[1] = timeHour[1] | dots_on;
@@ -1551,7 +1637,8 @@ void score_to_buf()
         Display_buf[6] = buf[0];
         Display_buf[7] = buf[1];
     }
-    Display_buf[8] = 0;
+
+    Display_buf[12] = 0;
 }
 
 void IPdisplay() {
@@ -1653,3 +1740,121 @@ void photo_sample(void) {
     }
 }
 
+//========================================================================================================
+void handleIRCommand(uint32_t command) {
+	if (command == KEY_COUNTDOWN_1) {
+		Serial.println("IR: COUNTDOWN BEGIN:");
+		
+        compare_elapsed = -1;
+        offset_time = 0;
+        uint8_t cntint = EEPROM.read(EEP_COUNTDOWN);
+        if (cntint > 99)
+            cntint = COUNTDOWN_INIT_TIME;
+        countdown_time = chrono.elapsed() + cntint * 60;
+        chrono.restart();
+        chrono.stop();
+        countdown_on = true;
+        game_on = true;
+
+		return;
+	}
+
+    switch (command) {
+    case KEY_EXIT:
+        Serial.println("IR: EXIT");
+        chrono.stop();
+        countdown_on = false;
+        game_on = false;
+        break;
+    case KEY_RESET:
+        Serial.println("IR: RESET");
+        //Reset the device
+        ESP.restart();
+        break;
+    case KEY_UP_COUNTER:
+        Serial.println("IR: UP COUNTER");
+        compare_elapsed = -1;
+        offset_time = 0;
+        chrono.restart();
+        chrono.stop();
+        countdown_on = false;
+        game_on = true;
+        break;
+    case KEY_COUNTDOWN_1:
+        Serial.println("IR: COUNTDOWN");
+        
+        break;
+    case KEY_PLAY:
+        chrono.resume();
+        //Send Start instruction to the shoot clock
+        Serial1.write(0XA1); Serial1.write(0X53);
+		Serial.println("IR: PLAY");
+        buzzer_ring(1);
+		break;
+    case KEY_STOP:		
+        //Send Start instruction to the shoot clock
+        Serial1.write(0XA1); Serial1.write(0X54);
+		chrono.stop();
+        Serial.println("IR: STOP");
+        buzzer_ring(1);
+		break;
+	case KEY_HOME_UP:
+		Serial.println("IR: HOST +1");
+        Score_host++;
+        if (Score_host > 99) { Score_host = 0; }
+        Serial.println(Score_host);
+        score_to_buf();
+        myLED.print(Display_buf, INVERT_DISPLAY);
+        updateStatusBoard();
+		break;
+	case KEY_HOME_DOWN:
+		Serial.println("IR: HOST -1");
+		Score_host--;
+		if (Score_host > 99) { Score_host = 0; }
+		Serial.println(Score_host);
+		score_to_buf();
+		myLED.print(Display_buf, INVERT_DISPLAY);
+		updateStatusBoard();
+		break;
+	case KEY_GUEST_UP:
+		Serial.println("IR: GUEST +1");
+		Score_guest++;
+		if (Score_guest > 99) { Score_guest = 0; }
+		Serial.println(Score_guest);
+		score_to_buf();
+		myLED.print(Display_buf, INVERT_DISPLAY);
+		updateStatusBoard();
+		break;
+	case KEY_GUEST_DOWN:
+		Serial.println("IR: GUEST -1");
+		Score_guest--;
+		if (Score_guest > 99) { Score_guest = 0; }
+		Serial.println(Score_guest);
+		score_to_buf();
+		myLED.print(Display_buf, INVERT_DISPLAY);
+		updateStatusBoard();
+		break;
+	case KEY_P1:
+        //Send Reset 24 instruction to the shoot clock
+        Serial1.write(0XA1); Serial1.write(0X51);
+		Serial.println("IR: P1");
+		break;
+	case KEY_P2:
+        //Send Reset 14 instruction to the shoot clock
+        Serial1.write(0XA1); Serial1.write(0X52);
+		Serial.println("IR: P2");
+		break;
+    case KEY_CLR:
+        Serial.println("IR: CLEAR SCORES");
+        Score_host = 0;
+        Score_guest = 0;
+        score_to_buf();
+        myLED.print(Display_buf, INVERT_DISPLAY);
+        updateStatusBoard();
+		break;
+    default:
+        Serial.print("IR: Unknown command 0x");
+        Serial.println(command, HEX);
+        break;
+    }
+}
